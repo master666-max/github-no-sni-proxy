@@ -978,6 +978,109 @@ def part_a():
         gp.CRL_PORT_FILE, gp.CRL_FILE = _old_pf, _old_cf
         shutil.rmtree(_td, ignore_errors=True)
 
+    # ---- A22 竞速切片必须覆盖全池（「有通道却从没去试」的回归护栏）----
+    #
+    # 2026-09-21 实测换来：旧写法 `ips = ips[:RACE_SIZE]` 每轮都竞速**同一批前 N 个**，
+    # 池尾 IP **从上线起就没被试过**。当日 github.com 的 101 次失败恰好全落在
+    # 被竞速的那 4 个上，而逐 IP 实测发现池外还有 10 个可用 ——
+    # 也就是说失败的大头不是「没通道」，是「有通道但从没去试」。
+    #
+    # 本用例守的就是这条：**在预算允许的调用次数内，池子里每个 IP 都必须被排到过。**
+    _pool = ["i%02d" % n for n in range(16)]
+    check(gp.race_slice(_pool, 6, 0) == ["i00", "i01", "i02", "i03", "i04", "i05"],
+          "A22 切片：步 0 → 头 2 个固定 + 尾段起始 4 个",
+          "%s" % (gp.race_slice(_pool, 6, 0),))
+    check(gp.race_slice(_pool, 6, 1) == ["i00", "i01", "i06", "i07", "i08", "i09"],
+          "A22 ★头部固定：步进后最快的 2 个仍留在切片里（保住快路）",
+          "%s" % (gp.race_slice(_pool, 6, 1),))
+    check(gp.race_slice(_pool, 6, 3) == ["i00", "i01", "i14", "i15", "i02", "i03"],
+          "A22 切片：尾段轮转回绕正确（池尾 I14/I15 能排进来）",
+          "%s" % (gp.race_slice(_pool, 6, 3),))
+    check(gp.race_slice(["a", "b"], 6, 3) == ["a", "b"],
+          "A22 切片：候选少于切片大小时原样返回（不重复、不报错）")
+    check(gp.race_slice([], 6, 0) == [],
+          "A22 切片：空候选安全")
+
+    # 核心不变量：单次建连能跑几次竞速调用 → 那几次必须覆盖全池
+    _calls = max(1, gp.REQUEST_BUDGET // gp.PHASE_BUDGET)
+    _seen = []
+    for _k in range(_calls):
+        _seen += gp.race_slice(_pool, gp.RACE_SIZE, _k)
+    _missed = [ip for ip in _pool if ip not in _seen]
+    check(not _missed,
+          "A22 ★不变量：单次建连的预算内，池里每个 IP 都能被排到至少一次",
+          "调用 %d 次 × 切片 %d；漏掉的: %s" % (_calls, gp.RACE_SIZE, _missed or "无"))
+
+    # 旧写法为什么不行 —— 反例固化下来，防止有人改回去
+    _old = []
+    for _k in range(_calls):
+        _old += _pool[:gp.RACE_SIZE]
+    check(len(set(_old)) < len(_pool),
+          "A22 反例：旧的 ips[:RACE_SIZE] 写法确实覆盖不全（这条证明用例有分辨力）",
+          "旧写法只覆盖 %d/%d 个" % (len(set(_old)), len(_pool)))
+
+    # 头段的 IP 必须**永远在**每次切片里（这是 p50 不再劣化的保证）
+    _head_always = all(
+        all(ip in gp.race_slice(_pool, gp.RACE_SIZE, k) for ip in _pool[:gp.RACE_HEAD])
+        for k in range(_calls))
+    check(_head_always,
+          "A22 ★头部 IP 在每次切片里都出现（否则慢 IP 会赢下冷启动 → p50 劣化）",
+          "RACE_HEAD=%d" % gp.RACE_HEAD)
+
+    # 游标必须真的推进
+    _before = gp._race_rotate
+    gp._race_rotate += 1
+    check(gp._race_rotate == _before + 1,
+          "A22 轮转游标逐步推进（连续请求才会换到不同步）")
+    gp._race_rotate = _before
+
+    # 池子的规模必须与切片×轮次相称：池子再大也不会被白放
+    _gh = gp.FALLBACK_IPS.get("github.com", [])
+    check(len(_gh) >= gp.RACE_SIZE,
+          "A22 github.com 兜底池不小于单次切片（否则切片恒等于全池）",
+          "%d 个 IP / 切片 %d" % (len(_gh), gp.RACE_SIZE))
+
+    # ---- A23 连接池保温：周期必须短于池过期，否则静默白保 ----
+    #
+    # 2026-09-21 定性：POOL_IDLE_TIMEOUT=45s，而真实用法是「隔几分钟点一下」
+    # ⇒ 池子基本永远空的，每次点击都重吃冷连接学费（实测首次 2.16s / 池化 0.27s）。
+    #
+    # ⚠️ 这条判据守的是一个**静默失效**：WARM_INTERVAL 一旦 >= POOL_IDLE_TIMEOUT，
+    #    保温线程每次保完、连接在下一轮之前就过期了 —— 表面上线程在跑、日志没异常，
+    #    实际一次都没保上。这种 bug 不会有任何信号。
+    check(gp.WARM_INTERVAL < gp.POOL_IDLE_TIMEOUT,
+          "A23 ★保温周期严格短于池过期时间（否则保了等于没保，且无任何报错）",
+          "WARM_INTERVAL=%d  POOL_IDLE_TIMEOUT=%d"
+          % (gp.WARM_INTERVAL, gp.POOL_IDLE_TIMEOUT))
+    check(gp.WARM_BUDGET < gp.REQUEST_BUDGET,
+          "A23 保温的等待预算小于用户请求的预算（保温不跟用户抢通道）",
+          "WARM_BUDGET=%d  REQUEST_BUDGET=%d" % (gp.WARM_BUDGET, gp.REQUEST_BUDGET))
+    check(len(gp.WARM_HOSTS) > 0 and all(isinstance(h, str) for h in gp.WARM_HOSTS),
+          "A23 保温域名表非空且是字符串",
+          "%s" % (gp.WARM_HOSTS,))
+    check(all(h in gp.FALLBACK_IPS for h in gp.WARM_HOSTS),
+          "A23 保温的每个域名都在兜底池里有 IP（否则保温只能靠 DNS）",
+          "缺: %s" % [h for h in gp.WARM_HOSTS if h not in gp.FALLBACK_IPS])
+
+    # _pool_has 必须**只看不取** —— 用 pool_get 做检查会把连接吃掉
+    gp._pool.clear()
+    check(gp._pool_has("github.com") is False,
+          "A23 空池时 _pool_has 返回 False")
+    class _WarmDummy:
+        def close(self):
+            pass
+    gp._pool[("github.com", "1.2.3.4", "github.com")] = [(_WarmDummy(), 0, time.time())]
+    check(gp._pool_has("github.com") is True,
+          "A23 有未过期连接时 _pool_has 返回 True")
+    check(len(gp._pool[("github.com", "1.2.3.4", "github.com")]) == 1,
+          "A23 ★_pool_has 只看不取（连接仍在池里，没被吃掉）",
+          "%d 条" % len(gp._pool[("github.com", "1.2.3.4", "github.com")]))
+    gp._pool[("github.com", "1.2.3.4", "github.com")] = [
+        (_WarmDummy(), 0, time.time() - gp.POOL_IDLE_TIMEOUT - 10)]
+    check(gp._pool_has("github.com") is False,
+          "A23 池里只剩过期连接时 _pool_has 返回 False")
+    gp._pool.clear()
+
     # ---- A20 204/304/HEAD 若被声明了 TE，这条连接不得复用 ----
     reuse, err, out = fwd(b"HTTP/1.1 304 Not Modified\r\n"
                           b"Transfer-Encoding: chunked\r\n\r\n", method="HEAD")

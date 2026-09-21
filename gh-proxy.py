@@ -203,10 +203,63 @@ HEADER_TIMEOUT_GET = 10         # 无体幂等请求（GET/HEAD）专用的「�
 FIRST_BYTE_TIMEOUT_GET = 10     # 同上，无体幂等请求的「体首字节」预算。
                                 # 实测 0.07~0.65s（4MB 流式下载也只要 0.35s）→ 10s 是 15 倍余量。
 MODE_PENALTY_TTL = 180          # 某模式刚在体传输上栽过，这段时间内排到最后
-RACE_SIZE = 4                   # 同时竞速的 IP 数
-RACE_ROUNDS = 2                 # 竞速跑几轮（RST 是概率性的）
-PHASE_BUDGET = 10               # 单轮最多花多少秒
-REQUEST_BUDGET = 20             # 建上游连接的总预算
+RACE_SIZE = 6                   # 同时竞速的 IP 数
+RACE_ROUNDS = 3                 # 竞速跑几轮（RST 是概率性的）
+
+# 竞速切片的轮转游标。见 race_slice()。
+# 必须是进程内单调递增的，让**连续请求**也用不同的切片。
+_race_rotate = 0
+
+
+RACE_HEAD = 2                   # 环形切片里**固定保留**的最快的几个 IP（不参与轮转）
+                                # 理由见 race_slice 的 docstring。
+
+
+def race_slice(ips, size, step, head=RACE_HEAD):
+    """环形切片：**头部固定**（最快的几个），**尾部轮转**。
+
+    `step` 是**调用序号**（0,1,2,…），不是字节偏移 ——
+    内部按「尾段长度 / 每次需要的格数」自增，保证连续几次调用**恰好把尾段铺满一遍**。
+
+    为什么需要（2026-09-21 实测换来的）：
+        旧写法是 `ips = ips[:RACE_SIZE]` —— 每轮都竞速**同一批前 N 个**，
+        池尾的 IP **从上线起就从未被试过**。
+        当日日志里 github.com 的 101 次失败恰好全落在被竞速的那 4 个上，
+        而同期逐 IP 实测发现池外还有 10 个可用 —— 也就是说，
+        **失败有一大半不是「没通道」，而是「有通道但从没去试」。**
+
+    为什么不整段轮转（踩过）：
+        第一版实现是**整段**环形轮转，A/B 实测 p50 从 2.89s **劣化到 4.76s**。
+        原因是轮转会把「实测最快的那几个 IP」挤出切片 ——
+        竞速的赢家是「谁先成功」，切片里若只剩 4~5s 的慢 IP，
+        哪怕池里有 0.3s 的 IP 也赢不了。
+        ⇒ 改成「**头 head 个固定 + 其余位置轮转**」：快路不动，尾部照样轮得到。
+
+    不变量（selftest A22 守着）：在单次建连能跑的那几次竞速调用里，
+    池子里**每个 IP 都要被排到至少一次** —— 否则「有通道却从没去试」会重演。
+    """
+    n = len(ips)
+    if n <= size:
+        return list(ips)
+    head_n = max(0, min(head, size))
+    fixed = list(ips[:head_n])
+    tail = ips[head_n:]
+    need = size - head_n
+    if not tail:
+        return list(ips[:size])
+    off = (step * need) % len(tail)
+    return fixed + [tail[(off + i) % len(tail)] for i in range(need)]
+PHASE_BUDGET = 6                # 单轮竞速最多花多少秒
+                                # 这个数 × 「单次建连能跑几轮」决定能试几段 IP 切片：
+                                #     REQUEST_BUDGET / PHASE_BUDGET = 竞速调用次数
+                                #     次数 / 2 = 走过的**不同切片**数（每轮两个模式各一次调用）
+                                # 原值 10 ⇒ 20/10 = 2 次 ⇒ **只有 1 段切片**（两个模式），
+                                # 于是 RACE_ROUNDS 设多大都轮不到第二段（2026-09-21 发现）。
+                                # 取 6 的另一个理由：实测最慢的可用 IP 约 5.2s，
+                                # 低于它会把这几个「慢但活着」的通道直接掐掉。
+REQUEST_BUDGET = 24             # 建上游连接的总预算
+                                # 20 → 24：为的是凑出「2 段切片 × 2 个模式」= 4 次竞速调用。
+                                # 代价：全部失败的极端情况下，用户多等 4 秒（反正要手动刷新）。
 MAX_ATTEMPTS = 3                # 单次请求最多试几遍
 ATTEMPT_BUDGET = 45             # 从收到请求算起，重试循环的总预算。
                                 # 3 遍 × (建连 20s + 停滞 12s) 理论上能到 90s，
@@ -314,17 +367,35 @@ _FASTLY_215 = ["185.199.108.215", "185.199.109.215",
                "185.199.110.215", "185.199.111.215"]
 
 FALLBACK_IPS = {
-    "github.com": ["20.205.243.166", "20.27.177.113", "20.200.245.247",
-                   "140.82.112.3", "140.82.113.3", "140.82.114.3"],
-    "www.github.com": ["20.205.243.166", "140.82.112.3", "140.82.113.3"],
+    # github.com —— 2026-09-21 逐 IP 实测（发 SNI / 不发 SNI 各一次，只看 HTTP 200）
+    # 22 个候选里 16 个可用。**同一时段 github.com 的失败恰好集中在旧池那 4 个上，
+    # 而池外 10 个是好的** —— 所以把它们全收进来（顺序≈实测耗时升序）。
+    "github.com": ["20.205.243.166", "20.207.73.82", "20.233.83.145",
+                   "4.208.26.197", "20.26.156.215", "20.27.177.113",
+                   "20.200.245.247", "4.237.22.38", "20.201.28.151",
+                   "140.82.112.3", "140.82.112.4", "140.82.113.3",
+                   "140.82.114.3", "140.82.114.4", "140.82.116.3",
+                   "140.82.121.3"],
+    # www 与 github.com 同池即可（同一边缘），但保留前几个快的
+    "www.github.com": ["20.205.243.166", "20.207.73.82", "4.208.26.197",
+                       "140.82.112.3", "140.82.113.3", "140.82.114.3",
+                       "140.82.116.3"],
     "uploads.github.com": ["20.205.243.161"],
-    "api.github.com": ["20.205.243.168", "140.82.112.6", "140.82.113.6",
-                       "140.82.114.6"],
+    # api —— 实测 8 个候选里 3 个可用；140.82.113.6 / 140.82.114.6 当前
+    # ConnectionReset（可能只是当前窗口），**保留**以免窗口过去后又缺通道；
+    # 新补的 140.82.116.6 实测 200。
+    "api.github.com": ["20.205.243.168", "140.82.112.6", "140.82.116.6",
+                       "140.82.113.6", "140.82.114.6"],
+    # codeload —— 新补 140.82.116.9（实测 200）；20.201.28.151 / 20.233.83.145 /
+    # 4.208.26.197 **不认 codeload 这个虚拟主机**（回 301），绝不能放进来。
     "codeload.github.com": ["140.82.112.9", "140.82.113.9", "140.82.114.9",
-                            "20.205.243.165"],
+                            "140.82.116.9", "20.205.243.165"],
     # gist 最顽固：会被 DNS 污染（实测 223.5.5.5 回 159.24.3.173、
-    # 119.29.29.29 回 243.185.187.39，都是假地址）→ 兜底池才是它的主力
-    "gist.github.com": ["140.82.112.4", "140.82.113.4", "140.82.114.4"],
+    # 119.29.29.29 回 243.185.187.39，都是假地址）→ 兜底池才是它的主力。
+    # 2026-09-21 实测：**此刻 gist 只有「不发 SNI」能通**（发 SNI 一律 ConnectionReset），
+    # 且可用 IP 是 140.82.112.4 / 20.205.243.166 / 20.207.73.82 —— 后两个是新增。
+    "gist.github.com": ["140.82.112.4", "20.205.243.166", "20.207.73.82",
+                        "140.82.113.4", "140.82.114.4"],
     "collector.github.com": ["140.82.114.22"],
     "alive.github.com": ["140.82.114.25"],
     "objects-origin.githubusercontent.com": ["140.82.114.22"],
@@ -759,17 +830,21 @@ def connect_upstream(host, budget=None):
         except Exception:
             GOOD_PEER.pop(host, None)
 
-    # 2) 竞速：按当前最优顺序，正常 SNI / 无 SNI 各跑几轮
-    ips = ips[:RACE_SIZE]
+    # 2) 竞速：按当前最优顺序，正常 SNI / 无 SNI 各跑几轮。
+    #    每轮换一段**环形切片**（见 race_slice）—— 旧写法 ips[:RACE_SIZE] 会让
+    #    池尾 IP 永远没机会；这是 2026-09-21 那次「有通道却从没去试」的直接修法。
+    global _race_rotate
     errs = []
     dead_modes = []          # 整段一个 IP 都没握手成功的模式
     for _round in range(RACE_ROUNDS):
+        batch = race_slice(ips, RACE_SIZE, _race_rotate)
+        _race_rotate += 1        # 步进 1：race_slice 内部按「尾段/格数」自增，保证铺满
         for mode in mode_order(host):
             remain = deadline - time.time()
             if remain < 2:
                 errs.append("预算耗尽")
                 break
-            sock, ip, e = race(ips, mode, min(PHASE_BUDGET, remain))
+            sock, ip, e = race(batch, mode, min(PHASE_BUDGET, remain))
             errs.extend(e)
             if sock is not None:
                 # 前面整段失败的模式 = 此刻它正被针对，记一笔惩罚挪到队尾。
@@ -864,6 +939,58 @@ def pool_put(host, ip, mode, sock, nreq):
             close_quietly(sock)
             return
         bucket.append((sock, nreq, time.time()))
+
+
+# ================================================================ 连接池保温
+#
+# 为什么需要（2026-09-21 定性）：
+#   POOL_IDLE_TIMEOUT = 45s，而真实用法是「看一会儿、隔几分钟再点一下」
+#   ⇒ 池子基本永远是空的，**每次点击都要重吃一遍冷连接学费**。
+#   实测同一域名的学费：首次 2.16s / 池化 0.27s —— 差 8 倍。
+#   保温把这条学费从「每次点击」摊成「每次连接过期」。
+#
+# 它**不改 GOOD_PEER 的选择逻辑**，只是在池子空了的时候先把连接拨好。
+# 失败一律静默：保温是优化不是功能，它挂掉不影响任何正常路径。
+WARM_HOSTS = ("github.com", "api.github.com", "codeload.github.com",
+              "raw.githubusercontent.com")
+WARM_INTERVAL = 20              # 秒。必须 **< POOL_IDLE_TIMEOUT(45)**，否则保了也白保
+WARM_BUDGET = 8                 # 单条保温连接最多等多久。刻意不用满 REQUEST_BUDGET(24)，
+                                # 免得保温线程跟用户请求抢通道
+WARM_FIRST_DELAY = 3            # 启动后先等一会儿再保，别和「刚起来那批请求」挤在一起
+
+
+def _pool_has(host):
+    """池里该 host 有没有还没过期的空闲连接。**只看不取**
+    （pool_get 是 pop，拿它做检查会把连接吃掉）。"""
+    now = time.time()
+    with _pool_lock:
+        for k, bucket in _pool.items():
+            if k[0] != host:
+                continue
+            for _s, nreq, ts in bucket:
+                if now - ts <= POOL_IDLE_TIMEOUT and nreq < POOL_MAX_REQ:
+                    return True
+    return False
+
+
+def start_warmer():
+    """起后台保温线程。返回线程对象（供自测 join/检查）。"""
+    def loop():
+        time.sleep(WARM_FIRST_DELAY)
+        while True:
+            for host in WARM_HOSTS:
+                try:
+                    if _pool_has(host):
+                        continue
+                    sock, ip, mode = connect_upstream(host, budget=WARM_BUDGET)
+                    pool_put(host, ip, mode, sock, 0)
+                except Exception:
+                    pass                        # 保温失败不影响任何正常路径
+            time.sleep(WARM_INTERVAL)
+
+    t = threading.Thread(target=loop, daemon=True, name="pool-warmer")
+    t.start()
+    return t
 
 
 def drop_pool(host, mode=None):
@@ -1881,6 +2008,8 @@ def main():
     ap.add_argument("-q", "--quiet", action="store_true", help="只报错")
     ap.add_argument("--no-verify-upstream", action="store_true",
                     help="危险：跳过上游证书链验证（仅限排障临时用，勿常开）")
+    ap.add_argument("--no-warm", action="store_true",
+                    help="关闭连接池保温（默认开；关掉后每次冷启动都要重吃握手学费）")
     args = ap.parse_args()
     global CLIENT_CTX_SNI, CLIENT_CTX_NOSNI, CLIENT_CTX
     VERBOSE = not args.quiet
@@ -1917,6 +2046,8 @@ def main():
     srv.listen(128)
     _write_pid()
     _crl_srv = start_crl_server()
+    if not args.no_warm:
+        start_warmer()
     print("=" * 62)
     print("  GitHub 无SNI反代 v2 已启动")
     print("  监听: %s:%d   证书: %s" % (args.host, args.port, os.path.basename(CERT_FILE)))
@@ -1926,6 +2057,8 @@ def main():
               % _crl_port())
     else:
         print("  CRL : 未启动 ⚠ schannel 工具（curl）会报 CRYPT_E_NO_REVOCATION_CHECK")
+    print("  池保温: %s（%d 个热门域，%ds 一轮）"
+          % ("关" if args.no_warm else "开", len(WARM_HOSTS), WARM_INTERVAL))
     print("  上游验证: %s" % ("已关闭(--no-verify-upstream) ⚠" if args.no_verify_upstream
                             else "系统根证书（链 + SNI 主机名）"))
     print("  Ctrl+C 停止")
