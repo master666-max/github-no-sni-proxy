@@ -212,6 +212,41 @@ github.com 的封锁。
 · 如果还在用 Watt Toolkit(Steam++)，建议把它的 GitHub 加速关掉，
   避免两套改 hosts/代理的机制互相打架。
 
+【CRL 分发 / 为什么 curl 会「无缘无故」打不开】
+------------------------------------------------------------
+（2026-09-21 新增。这是本项目踩过最隐蔽的一个坑。）
+
+症状：
+  curl: (35) schannel: next InitializeSecurityContext failed:
+  CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - 吊销功能无法检查证书是否吊销。
+
+⚠️ 错误信息有误导性。它读起来像「CRL/OCSP 服务器连不上」，
+   实际是**反代自己出示的证书压根没声明任何 CRL 地址** ——
+   「没有东西可查」不等于「查不到东西」。两者修法完全不同。
+
+⚠️ 而且**只有 curl 中招**。Windows 上 git 与 curl 都走 schannel，
+   但 Git for Windows 对吊销失败的容忍度更高：实测 git 2.55 默认就能 clone。
+   所以排查时**必须把 git 和 curl 分开实测**，别假设「两个都坏了」。
+
+本项目的做法（三处配合，全自动，无需任何开关）：
+  ① gen_certs.py 给服务器证书加
+       crlDistributionPoints = http://127.0.0.1:<端口>/ca.crl
+     并用 openssl ca -gencrl 生成 certs/ca.crl；
+     端口写进 certs/crl-port.txt（默认 18444），反代据此监听 —— 两端不会错位。
+  ② gh-proxy.py 在本机该端口起一个**只服务 /ca.crl** 的极小 HTTP 监听。
+  ③ schannel 取到 CRL → 吊销检查真正成功 → 放行。
+
+  → curl / git / 任何 schannel 工具都**不需要任何开关**。
+
+实测反证：`file://` 形式的 CRL 分发点 **Windows 链引擎不读**，
+吊销状态仍是 UNKNOWN，等于白写。所以只能用 http://。
+
+若该监听因故没起来（端口被占等），反代启动横幅会明确报警，此时回退方案：
+  在 %USERPROFILE%\.curlrc 写一行  ssl-revoke-best-effort
+  （比 --ssl-no-revoke 好：仍然尝试检查，只是吊销源不可达时不硬失败）
+
+改了证书（重跑 gen_certs.py）之后，必须重启反代才生效。
+
 【已知限制】(2026-09-19 安全审计补充)
 ------------------------------------------------------------
 1. 「无 SNI」回退模式只验证证书链、无法核对主机名。本反代已把可信根证书
