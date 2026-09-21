@@ -1,12 +1,16 @@
-# ---- 证书：全部由 gen_certs.py 在本机生成，一律不入库 ----
+# ---- 证书 / CRL：全部由 gen_certs.py 在本机生成，一律不入库 ----
 # 私钥泄露 = 任何人可伪造任意站点证书；
-# 公钥入库也没意义，每个使用者必须自建自己的 CA。
+# 公钥与 CRL 入库也没意义，每个使用者必须自建自己的 CA。
 certs/*.key
 certs/*.crt
 certs/*.csr
 certs/*.pem
 certs/*.srl
 certs/.srl
+certs/ca.crl
+certs/crl-port.txt
+certs/ca-db/
+certs/*.bak-*
 # 保留（属于仓库内容）：certs/ca.cnf  certs/server-ext.cnf
 
 # ---- 运行时状态 ----

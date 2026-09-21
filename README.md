@@ -27,6 +27,8 @@ GFW 对 GitHub 的阻断**按 TLS 握手里的 SNI 字段精确匹配** —— �
 - **分帧严格按类型收尾** —— `chunked` 必须读到收尾块、`length` 必须读满、
   只有 `eof` 才是「上游关连接 = 正常结束」
 - **白名单收口** —— 只有 GitHub 相关域名会转发，其余一律 403
+- **自带 CRL 分发** —— 证书声明 CRL 分发点、反代顺手把它喂出去，
+  于是 curl / git 在 Windows 上**不需要任何开关**（见下）
 - **内置自测** —— 147+ 项离线单测 + 真 `git push` 端到端，不联网约 12s 跑完
 
 ## 目录结构
@@ -83,6 +85,43 @@ python gen_certs.py
 
 > ⚠️ 这是 TLS 中间人。**私有 CA 私钥等同于你所有 HTTPS 流量的伪造能力**，
 > 请勿外泄，也不要把 `certs/*.key` 提交到任何仓库（`.gitignore` 已排除）。
+
+## 为什么 Windows 上的 curl 会「无缘无故」打不开
+
+这是本项目踩过的最隐蔽的一个坑，值得单独说明。
+
+Windows 上 curl / git 走的是 **schannel**（系统原生 TLS），它会**强制**做
+证书吊销检查（CRL / OCSP）。而本方案出示的证书由**你自己的私有 CA** 签发 ——
+如果那张证书没声明任何吊销源，schannel 就找不到东西可查，直接报：
+
+```
+curl: (35) schannel: next InitializeSecurityContext failed:
+CRYPT_E_NO_REVOCATION_CHECK (0x80092012) - 吊销功能无法检查证书是否吊销。
+```
+
+**注意错误信息的误导性**：它读起来像「CRL 服务器连不上」，实际是
+「证书里压根没写 CRL 地址」。两者修法完全不同。
+
+而且**只有 curl 会中招** —— Git for Windows 对吊销失败的处理宽松得多，
+`git clone` 默认就能过。所以排查时**务必把 git 和 curl 分开实测**，
+不要假设「两个都坏了」。
+
+**本项目的做法**（`gen_certs.py` + `gh-proxy.py` 配合）：
+
+1. 给服务器证书加 `crlDistributionPoints = http://127.0.0.1:<端口>/ca.crl`
+2. 生成对应的 CRL 文件
+3. 反代在同端口起一个只服务该 CRL 的极小 HTTP 监听
+
+schannel 取到 CRL → 吊销检查**真正成功** → 放行。
+于是 curl / git / 任何 schannel 工具都**不需要任何开关**。
+
+> 实测（2026-09-21，ctypes 直调 `crypt32` 读链的 `TrustStatus`）：
+> `file://` 形式的 CRL 分发点**Windows 链引擎不读**，吊销状态仍是 UNKNOWN，
+> 只有 `http://` 才真正被取回。所以别图省事改成 `file://`。
+
+若该监听因故未起来，反代会在启动横幅里明确报警，此时回退方案是给 curl 加
+`--ssl-revoke-best-effort`（仍尝试检查，只是不硬失败），
+写进 `%USERPROFILE%\.curlrc` 即全局生效。
 
 ## 它到底改了什么
 

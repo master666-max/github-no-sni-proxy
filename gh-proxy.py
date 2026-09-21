@@ -62,6 +62,105 @@ if not os.path.exists(CERT_FILE):
     CERT_FILE = os.path.join(CERT_DIR, "server.crt")
 PID_FILE = os.path.join(BASE_DIR, "gh-proxy.pid")
 
+# ---- CRL 分发（解决 schannel 的 CRYPT_E_NO_REVOCATION_CHECK）----
+#
+# Windows 上 curl / git 走 schannel，它**强制**做证书吊销检查。我们出示的是
+# 自家私有 CA 签发的证书 —— 若那张证书没声明任何吊销源，schannel 就报
+#     CRYPT_E_NO_REVOCATION_CHECK (0x80092012)
+# 并掐断握手。症状极难归因：「curl 打不开，但浏览器和 git 有时又没事」。
+#
+# 解法：证书里声明 crlDistributionPoints = http://127.0.0.1:<CRL_PORT>/ca.crl，
+# 这里起一个只服务该 CRL 的极小 HTTP 监听 —— 检查能真正取到 CRL，于是
+# curl / git / 任何 schannel 工具**都不需要任何开关**。
+#
+# ⚠️ 实测（2026-09-21）：`file://` 形式的 CDP Windows 链引擎**不读**，
+#    只有 `http://` 才真正被取回。别改成 file://。
+CRL_FILE = os.path.join(CERT_DIR, "ca.crl")
+CRL_PORT_FILE = os.path.join(CERT_DIR, "crl-port.txt")
+DEFAULT_CRL_PORT = 18444
+
+
+def _crl_port():
+    """CRL 监听端口。以 certs/crl-port.txt 为准（gen_certs.py 写入、
+    证书 CDP 也按它生成），缺失或非法则退回默认值。"""
+    try:
+        with open(CRL_PORT_FILE) as f:
+            p = int(f.read().strip())
+        if 1024 <= p <= 65535:
+            return p
+    except Exception:
+        pass
+    return DEFAULT_CRL_PORT
+
+
+def start_crl_server():
+    """起一个只服务 /ca.crl 的极小 HTTP 监听（仅 127.0.0.1）。
+
+    失败**不致命**：TLS 反代照常工作，只是 schannel 工具会报
+    CRYPT_E_NO_REVOCATION_CHECK。所以这里只记日志、返回 None。
+
+    返回监听 socket 或 None。
+    """
+    port = _crl_port()
+    if not os.path.exists(CRL_FILE):
+        log("  [!] 缺 %s —— 证书已声明 CDP 却取不到 CRL，"
+            "curl 会报 CRYPT_E_NO_REVOCATION_CHECK。请跑 gen_certs.py。"
+            % os.path.basename(CRL_FILE), warn=True)
+        return None
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    except (AttributeError, OSError):
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError as e:
+        log("  [!] CRL 监听绑定 127.0.0.1:%d 失败: %s" % (port, str(e)[:60]),
+            warn=True)
+        log("      影响：schannel 工具（curl）会报 CRYPT_E_NO_REVOCATION_CHECK。",
+            warn=True)
+        return None
+    s.listen(16)
+
+    def loop():
+        while True:
+            try:
+                conn, _addr = s.accept()
+            except Exception:
+                return                       # socket 被关 = 正常退出
+            try:
+                conn.settimeout(3)
+                req = b""
+                while b"\r\n" not in req and len(req) < 4096:
+                    c = conn.recv(1024)
+                    if not c:
+                        break
+                    req += c
+                path = "/"
+                try:
+                    path = req.split(b" ")[1].decode("latin-1")
+                except Exception:
+                    pass
+                if path.split("?", 1)[0].rstrip("/") in ("/ca.crl", ""):
+                    data = open(CRL_FILE, "rb").read()
+                    conn.sendall(
+                        b"HTTP/1.1 200 OK\r\n"
+                        b"Content-Type: application/pkix-crl\r\n"
+                        b"Content-Length: " + str(len(data)).encode() + b"\r\n"
+                        b"Cache-Control: no-store\r\n"
+                        b"Connection: close\r\n\r\n" + data)
+                else:
+                    conn.sendall(b"HTTP/1.1 404 Not Found\r\n"
+                                 b"Content-Length: 0\r\nConnection: close\r\n\r\n")
+            except Exception:
+                pass
+            finally:
+                close_quietly(conn)
+
+    threading.Thread(target=loop, daemon=True).start()
+    return s
+
 
 # ================================================================ 配置
 
@@ -1817,10 +1916,16 @@ def main():
 
     srv.listen(128)
     _write_pid()
+    _crl_srv = start_crl_server()
     print("=" * 62)
     print("  GitHub 无SNI反代 v2 已启动")
     print("  监听: %s:%d   证书: %s" % (args.host, args.port, os.path.basename(CERT_FILE)))
     print("  流式搬运 · 上游连接池 · 只服务 GitHub 域名")
+    if _crl_srv:
+        print("  CRL : http://127.0.0.1:%d/ca.crl（供 schannel 做吊销检查）"
+              % _crl_port())
+    else:
+        print("  CRL : 未启动 ⚠ schannel 工具（curl）会报 CRYPT_E_NO_REVOCATION_CHECK")
     print("  上游验证: %s" % ("已关闭(--no-verify-upstream) ⚠" if args.no_verify_upstream
                             else "系统根证书（链 + SNI 主机名）"))
     print("  Ctrl+C 停止")

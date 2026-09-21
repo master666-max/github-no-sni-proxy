@@ -882,6 +882,102 @@ def part_a():
           "通道被判死后，该模式名下的池化连接被清掉并关闭（不留 fd）",
           "池=%s closed=%s" % (gp._pool, s_old.closed))
 
+    # ---- A21 CRL 分发：证书 CDP 端口必须与反代实际监听端口一致 ----
+    #
+    # 为什么值得一条独立用例：Windows 上 curl/git 走 schannel，会**强制**做证书
+    # 吊销检查。证书里声明 crlDistributionPoints = http://127.0.0.1:<port>/ca.crl，
+    # 反代起一个极小 HTTP 监听把 CRL 喂出去 —— 两端端口必须一致。
+    # 一旦错位，schannel 取不到 CRL → CRYPT_E_NO_REVOCATION_CHECK → curl 直接挂，
+    # 而且**不会有任何显式报错**，只表现为「curl 打不开」，极难归因。
+    import tempfile as _tf
+    import urllib.request as _url
+    _openssl = None
+    for _c in (r"C:\Program Files\Git\usr\bin\openssl.exe",
+               r"C:\Program Files\Git\mingw64\bin\openssl.exe",
+               r"C:\Windows\System32\openssl.exe"):
+        if os.path.exists(_c):
+            _openssl = _c
+            break
+    _td = _tf.mkdtemp(prefix="ghp-crl-")
+    _pf = os.path.join(_td, "crl-port.txt")
+    _old_pf, _old_cf = gp.CRL_PORT_FILE, gp.CRL_FILE
+    try:
+        # ① 端口解析三态
+        with open(_pf, "w") as f:
+            f.write("29999\n")
+        gp.CRL_PORT_FILE = _pf
+        check(gp._crl_port() == 29999, "A21 CRL 端口：从 crl-port.txt 正确读取")
+        with open(_pf, "w") as f:
+            f.write("not-a-number\n")
+        check(gp._crl_port() == gp.DEFAULT_CRL_PORT,
+              "A21 CRL 端口：内容非法时退回默认值")
+        with open(_pf, "w") as f:
+            f.write("70000\n")          # 越界
+        check(gp._crl_port() == gp.DEFAULT_CRL_PORT,
+              "A21 CRL 端口：越界值退回默认值")
+        os.remove(_pf)
+        check(gp._crl_port() == gp.DEFAULT_CRL_PORT,
+              "A21 CRL 端口：文件缺失时退回默认值")
+
+        # ② 真起一次服务，验证它确实把 CRL 字节喂出去、别的路径给 404
+        _src_crl = os.path.join(gp.CERT_DIR, "ca.crl")
+        if os.path.exists(_src_crl):
+            _s = socket.socket()
+            _s.bind(("127.0.0.1", 0))
+            _freeport = _s.getsockname()[1]
+            _s.close()
+            with open(_pf, "w") as f:
+                f.write("%d\n" % _freeport)
+            gp.CRL_PORT_FILE = _pf
+            gp.CRL_FILE = _src_crl
+            _srv = gp.start_crl_server()
+            check(_srv is not None, "A21 CRL 监听能起来")
+            if _srv is not None:
+                time.sleep(0.3)
+                _want = open(_src_crl, "rb").read()
+                try:
+                    _got = _url.urlopen(
+                        "http://127.0.0.1:%d/ca.crl" % _freeport, timeout=5).read()
+                    check(_got == _want,
+                          "A21 取回的 CRL 字节与文件一致",
+                          "%d B" % len(_got))
+                except Exception as _e:
+                    check(False, "A21 取回 CRL", str(_e)[:60])
+                try:
+                    _url.urlopen("http://127.0.0.1:%d/nope" % _freeport,
+                                 timeout=5).read()
+                    _code = 200
+                except Exception as _e:
+                    _code = getattr(_e, "code", 0)
+                check(_code == 404, "A21 只服务 /ca.crl，其它路径 404",
+                      "code=%s" % _code)
+                _srv.close()
+        else:
+            skip("A21 CRL 服务端到端（本目录尚无 certs/ca.crl）")
+
+        # ③ 最关键的不变量：证书里写的 CDP 端口 == 反代**实际**会监听的端口
+        #   （先把 CRL_PORT_FILE 还原成生产路径，否则比的是临时文件，等于自证）
+        gp.CRL_PORT_FILE = _old_pf
+        _real_port = gp._crl_port()
+        _crt = gp.CERT_FILE
+        if os.path.exists(_crt) and _openssl:
+            _r = subprocess.run([_openssl, "x509", "-in", _crt, "-noout", "-text"],
+                                capture_output=True)
+            _txt = (_r.stdout or b"").decode("utf-8", "replace")
+            import re as _re
+            _m = _re.search(r"URI:http://127\.0\.0\.1:(\d+)/ca\.crl", _txt)
+            if _m:
+                check(int(_m.group(1)) == _real_port,
+                      "A21 证书 CDP 端口 == 反代实际监听端口（错位即 curl 挂）",
+                      "CDP=%s 反代=%d" % (_m.group(1), _real_port))
+            else:
+                skip("A21 证书未声明 CDP（跑 gen_certs.py 后会补上）")
+        else:
+            skip("A21 证书 CDP 校验（无证书或无 openssl）")
+    finally:
+        gp.CRL_PORT_FILE, gp.CRL_FILE = _old_pf, _old_cf
+        shutil.rmtree(_td, ignore_errors=True)
+
     # ---- A20 204/304/HEAD 若被声明了 TE，这条连接不得复用 ----
     reuse, err, out = fwd(b"HTTP/1.1 304 Not Modified\r\n"
                           b"Transfer-Encoding: chunked\r\n\r\n", method="HEAD")
