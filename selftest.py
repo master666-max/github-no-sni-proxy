@@ -2341,6 +2341,14 @@ def part_c():
              "本机没装 git-http-backend（精简版 PortableGit 不带它），跳过")
         return
 
+    # 证书是 build_server_ctx() 的硬前置；缺了就明说怎么补，别甩一行 traceback
+    _missing_certs = [p for p in (gp.CERT_FILE, gp.KEY_FILE) if not os.path.exists(p)]
+    if _missing_certs:
+        skip("真 git push 端到端",
+             "缺少证书 %s —— 先运行: python gen_certs.py，再重跑本自检"
+             % ", ".join(os.path.basename(p) for p in _missing_certs))
+        return
+
     from http.server import ThreadingHTTPServer
 
     work = os.path.join(tempfile.gettempdir(), "ghproxy_e2e")
