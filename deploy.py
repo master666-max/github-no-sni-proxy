@@ -11,6 +11,7 @@ import ctypes
 import shutil
 import socket
 import subprocess
+import tempfile
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -18,6 +19,24 @@ except Exception:
     pass
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+
+# ---- 部署目录体检（2026-09-26）----
+# 证书、gh-proxy.log、hosts 备份全部写进本目录；若从系统临时目录部署，
+# 磁盘清理会把运行状态一并带走，导致「昨天还好好的今天证书没了」。
+try:
+    _BASE_ABS = os.path.normcase(os.path.abspath(BASE))
+    _TEMP_ABS = os.path.normcase(os.path.abspath(tempfile.gettempdir()) + os.sep)
+    _IN_TEMP = _BASE_ABS.startswith(_TEMP_ABS)
+except Exception:
+    _IN_TEMP = False
+if _IN_TEMP:
+    print("[!] 警告：正在从临时目录部署（%s）" % BASE)
+    print("    证书、日志、hosts 备份都会写进这里，系统清理临时文件时会一并删掉，")
+    print("    到时反代会因证书缺失起不来。建议先把整个工具目录移动到固定位置，")
+    print("    例如 %%LOCALAPPDATA%%\\Programs\\github-no-sni-proxy，再运行本脚本。")
+    print("    5 秒后继续部署，按 Ctrl+C 放弃……")
+    time.sleep(5)
+
 HOSTS = r"C:\Windows\System32\drivers\etc\hosts"
 HOSTS_BAK = os.path.join(BASE, "hosts.backup-original.txt")
 CA_CRT = os.path.join(BASE, "certs", "ca.crt")
